@@ -133,9 +133,15 @@ def main():
     # CSS 隐藏 Deploy, Footer, 以及调整 Expander 样式
     hide_streamlit_style = """
         <style>
-        .stDeployButton {display:none;}
+        /* 隐藏右上角的 Deploy 按钮 */
+        .stAppDeployButton {display:none !important;}
+        
+        /* 隐藏右上角的汉堡菜单 (可选) */
         #MainMenu {visibility: hidden;}
+        
+        /* 隐藏页脚 Made with Streamlit */
         footer {visibility: hidden;}
+        
         /* 调整Expander头部字体，使其更清晰 */
         .streamlit-expanderHeader {
             font-family: 'Segoe UI', sans-serif;
@@ -143,6 +149,9 @@ def main():
             font-weight: 500;
             color: #31333F;
         }
+        
+        /* 针对较新版本的隐藏方式 */
+        header {visibility: hidden;}
         </style>
         """
     st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -258,7 +267,7 @@ def main():
                         cols = st.columns(min(len(imgs), 4)) 
                         for i, img_data in enumerate(imgs):
                             with cols[i % 4]:
-                                st.image(img_data[0], use_column_width=True)
+                                st.image(img_data[0], use_container_width=True)
                     else:
                         st.caption(L["lbl_no_img"])
         else:
