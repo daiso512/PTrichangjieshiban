@@ -1,3 +1,8 @@
+<<<<<<< HEAD
 streamlit
 pandas
 supabase
+=======
+streamlit
+pandas
+>>>>>>> a9606010c64c39c5b13c2778ed86c0468f2eb027
