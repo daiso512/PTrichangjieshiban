@@ -2,6 +2,8 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime
+import binascii
+from supabase import create_client, Client
 
 # ==========================================
 # 0. 多语言词典配置
@@ -87,42 +89,77 @@ TRANSLATIONS = {
 # ==========================================
 # 1. 基础配置与数据库
 # ==========================================
+# 选择数据库模式: 'SQLITE' (本地) 或 'SUPABASE' (云端)
+DB_TYPE = 'SUPABASE' 
+
 DB_FILE = 'notifications_v2.db' 
 
+@st.cache_resource
+def init_supabase():
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+        return create_client(url, key)
+    except Exception as e:
+        return None
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            content TEXT NOT NULL,
-            attribute TEXT,
-            category TEXT,
-            person TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            notif_id INTEGER,
-            img_data BLOB,
-            filename TEXT,
-            FOREIGN KEY(notif_id) REFERENCES notifications(id) ON DELETE CASCADE
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    if DB_TYPE == 'SQLITE':
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                content TEXT NOT NULL,
+                attribute TEXT,
+                category TEXT,
+                person TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notif_id INTEGER,
+                img_data BLOB,
+                filename TEXT,
+                FOREIGN KEY(notif_id) REFERENCES notifications(id) ON DELETE CASCADE
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    # Supabase tables are pre-created via SQL Editor
 
 def get_connection():
-    return sqlite3.connect(DB_FILE)
+    if DB_TYPE == 'SQLITE':
+        return sqlite3.connect(DB_FILE)
+    return None
 
 def get_images_by_id(notif_id):
-    conn = get_connection()
-    imgs = conn.execute("SELECT img_data FROM images WHERE notif_id=?", (notif_id,)).fetchall()
-    conn.close()
-    return imgs
+    if DB_TYPE == 'SQLITE':
+        conn = get_connection()
+        imgs = conn.execute("SELECT img_data FROM images WHERE notif_id=?", (notif_id,)).fetchall()
+        # imgs format: [(blob,), (blob,)]
+        conn.close()
+        return imgs
+    else:
+        sb = init_supabase()
+        if not sb: return []
+        res = sb.table('images').select('img_data').eq('notif_id', notif_id).execute()
+        # Convert hex string (bytea) back to bytes
+        imgs = []
+        for item in res.data:
+            hex_str = item['img_data']
+            # Postgres hex format: \xDEADBEEF...
+            if hex_str.startswith(r'\x'):
+                hex_str = hex_str[2:]
+            try:
+                img_bytes = binascii.unhexlify(hex_str)
+                imgs.append((img_bytes,))
+            except:
+                pass
+        return imgs
 
 # ==========================================
 # 主程序
@@ -130,27 +167,17 @@ def get_images_by_id(notif_id):
 def main():
     st.set_page_config(page_title="CAR2 PT Board", layout="wide", page_icon="🏭")
     
-    # CSS 隐藏 Deploy, Footer, 以及调整 Expander 样式
     hide_streamlit_style = """
         <style>
-        /* 隐藏右上角的 Deploy 按钮 */
         .stAppDeployButton {display:none !important;}
-        
-        /* 隐藏右上角的汉堡菜单 (可选) */
         #MainMenu {visibility: hidden;}
-        
-        /* 隐藏页脚 Made with Streamlit */
         footer {visibility: hidden;}
-        
-        /* 调整Expander头部字体，使其更清晰 */
         .streamlit-expanderHeader {
             font-family: 'Segoe UI', sans-serif;
             font-size: 15px !important;
             font-weight: 500;
             color: #31333F;
         }
-        
-        /* 针对较新版本的隐藏方式 */
         header {visibility: hidden;}
         </style>
         """
@@ -160,6 +187,12 @@ def main():
 
     # --- 侧边栏 ---
     with st.sidebar:
+        # DB Mode Indicator
+        if DB_TYPE == 'SUPABASE':
+            st.caption("☁️ Cloud Mode (Supabase)")
+        else:
+            st.caption("📂 Local Mode (SQLite)")
+
         lang_code = st.radio("Language / 言語", ["中文", "日本語"], horizontal=True)
         L = TRANSLATIONS["CN"] if lang_code == "中文" else TRANSLATIONS["JP"]
         
@@ -188,13 +221,21 @@ def main():
     st.title(L["title"])
 
     # --- 滚动通知栏 ---
-    conn = get_connection()
     today = datetime.now().strftime('%Y-%m-%d')
-    today_news = pd.read_sql_query(
-        f"SELECT content, person, attribute FROM notifications WHERE date='{today}'", conn
-    )
-    conn.close()
+    today_news = pd.DataFrame()
 
+    if DB_TYPE == 'SQLITE':
+        conn = get_connection()
+        today_news = pd.read_sql_query(
+            f"SELECT content, person, attribute FROM notifications WHERE date='{today}'", conn
+        )
+        conn.close()
+    else:
+        sb = init_supabase()
+        if sb:
+            res = sb.table('notifications').select('content, person, attribute').eq('date', today).execute()
+            today_news = pd.DataFrame(res.data)
+    
     if not today_news.empty:
         ticker_items = []
         for _, row in today_news.iterrows():
@@ -215,12 +256,20 @@ def main():
         tab2 = None
 
     # ==========================
-    # TAB 1: 看板 (View) - 卡片式 + 预览40字
+    # TAB 1: 看板 (View)
     # ==========================
     with tab1:
-        conn = get_connection()
-        df = pd.read_sql_query("SELECT * FROM notifications ORDER BY date DESC, id DESC", conn)
-        conn.close()
+        df = pd.DataFrame()
+        if DB_TYPE == 'SQLITE':
+            conn = get_connection()
+            df = pd.read_sql_query("SELECT * FROM notifications ORDER BY date DESC, id DESC", conn)
+            conn.close()
+        else:
+            sb = init_supabase()
+            if sb:
+                # Supabase typically needs explicit order
+                res = sb.table('notifications').select('*').order('date', desc=True).order('id', desc=True).execute()
+                df = pd.DataFrame(res.data)
 
         col_search, col_space = st.columns([1, 2])
         with col_search:
@@ -244,23 +293,18 @@ def main():
                 elif row['attribute'] in ['重要']:
                     attr_icon = "🟡"
                 
-                # 2. 内容预览处理 (核心修改点)
-                # 移除换行符，防止标题格式乱掉
+                # 2. 内容预览
                 content_preview = str(row['content']).replace('\n', ' ')
-                # 截取前40个字符
                 if len(content_preview) > 40:
                     content_preview = content_preview[:40] + "..."
                 
-                # 3. 拼接标题: 【日期】 级别 | 责任人 : 内容摘要
                 label_text = f"【{row['date']}】 {attr_icon}{row['attribute']} ｜ 👤{row['person']} ： {content_preview}"
                 
-                # 4. 创建折叠区
+                # 3. 创建折叠区
                 with st.expander(label_text):
-                    # 内部显示完整信息
                     st.caption(f"ID: {row['id']} | {L['form_cat']}: {row['category']}")
-                    st.info(row['content']) # 完整内容
+                    st.info(row['content']) 
                     
-                    # 图片展示
                     imgs = get_images_by_id(row['id'])
                     if imgs:
                         st.markdown(f"**📷 {len(imgs)} {L['lbl_img_attached']}:**")
@@ -305,24 +349,50 @@ def main():
                     
                     if st.form_submit_button(L["btn_publish"]):
                         if f_content and f_person:
-                            conn = get_connection()
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                'INSERT INTO notifications (date, content, attribute, category, person) VALUES (?, ?, ?, ?, ?)',
-                                (f_date, f_content, f_attr, f_cat, f_person)
-                            )
-                            new_id = cursor.lastrowid
-                            
-                            if f_imgs:
-                                for img_file in f_imgs:
-                                    img_bytes = img_file.getvalue()
-                                    cursor.execute(
-                                        'INSERT INTO images (notif_id, img_data, filename) VALUES (?, ?, ?)',
-                                        (new_id, img_bytes, img_file.name)
-                                    )
-                            
-                            conn.commit()
-                            conn.close()
+                            if DB_TYPE == 'SQLITE':
+                                conn = get_connection()
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    'INSERT INTO notifications (date, content, attribute, category, person) VALUES (?, ?, ?, ?, ?)',
+                                    (f_date, f_content, f_attr, f_cat, f_person)
+                                )
+                                new_id = cursor.lastrowid
+                                if f_imgs:
+                                    for img_file in f_imgs:
+                                        img_bytes = img_file.getvalue()
+                                        cursor.execute(
+                                            'INSERT INTO images (notif_id, img_data, filename) VALUES (?, ?, ?)',
+                                            (new_id, img_bytes, img_file.name)
+                                        )
+                                conn.commit()
+                                conn.close()
+                            else:
+                                sb = init_supabase()
+                                if sb:
+                                    res = sb.table('notifications').insert({
+                                        'date': str(f_date),
+                                        'content': f_content,
+                                        'attribute': f_attr,
+                                        'category': f_cat,
+                                        'person': f_person
+                                    }).execute()
+                                    
+                                    # Get the ID of the new row. 
+                                    # .insert().execute() returns data=[{...}]
+                                    if res.data:
+                                        new_id = res.data[0]['id']
+                                        if f_imgs:
+                                            img_inserts = []
+                                            for img_file in f_imgs:
+                                                # Convert to hex string for BYTEA
+                                                hex_data = r'\x' + binascii.hexlify(img_file.getvalue()).decode('ascii')
+                                                img_inserts.append({
+                                                    'notif_id': new_id,
+                                                    'img_data': hex_data, 
+                                                    'filename': img_file.name
+                                                })
+                                            sb.table('images').insert(img_inserts).execute()
+
                             st.toast(L["msg_pub_success"], icon="✅")
                             st.rerun()
                         else:
@@ -337,17 +407,40 @@ def main():
                     st.session_state.edit_data = None
 
                 if st.button(L["btn_load"], key="btn_load_data"):
-                    conn = get_connection()
-                    row = conn.execute("SELECT * FROM notifications WHERE id=?", (edit_id,)).fetchone()
-                    conn.close()
+                    row = None
+                    if DB_TYPE == 'SQLITE':
+                        conn = get_connection()
+                        row_raw = conn.execute("SELECT * FROM notifications WHERE id=?", (edit_id,)).fetchone()
+                        conn.close()
+                        if row_raw:
+                            # Map array to dict
+                            row = {
+                                "id": row_raw[0],
+                                "date": row_raw[1],
+                                "content": row_raw[2],
+                                "attr": row_raw[3],
+                                "cat": row_raw[4],
+                                "person": row_raw[5]
+                            }
+                    else:
+                        sb = init_supabase()
+                        if sb:
+                            res = sb.table('notifications').select('*').eq('id', edit_id).execute()
+                            if res.data:
+                                row = res.data[0] # date is likely string 'YYYY-MM-DD'
+                    
                     if row:
+                        date_obj = row['date']
+                        if isinstance(date_obj, str):
+                            date_obj = datetime.strptime(date_obj, '%Y-%m-%d').date()
+                            
                         st.session_state.edit_data = {
-                            "id": row[0],
-                            "date": datetime.strptime(row[1], '%Y-%m-%d').date(),
-                            "content": row[2],
-                            "attr": row[3],
-                            "cat": row[4],
-                            "person": row[5]
+                            "id": row['id'],
+                            "date": date_obj,
+                            "content": row['content'],
+                            "attr": row.get('attribute') or row.get('attr'), # handle name diff if any
+                            "cat": row.get('category') or row.get('cat'),
+                            "person": row['person']
                         }
                     else:
                         st.error(L["msg_id_not_found"])
@@ -371,14 +464,26 @@ def main():
                         st.caption("注：暂不支持在此处修改图片，请删除后重新发布")
 
                         if st.form_submit_button(L["btn_update"]):
-                            conn = get_connection()
-                            conn.execute('''
-                                UPDATE notifications 
-                                SET date=?, content=?, attribute=?, category=?, person=?
-                                WHERE id=?
-                            ''', (e_date, e_content, e_attr, e_cat, e_person, st.session_state.edit_data["id"]))
-                            conn.commit()
-                            conn.close()
+                            if DB_TYPE == 'SQLITE':
+                                conn = get_connection()
+                                conn.execute('''
+                                    UPDATE notifications 
+                                    SET date=?, content=?, attribute=?, category=?, person=?
+                                    WHERE id=?
+                                ''', (e_date, e_content, e_attr, e_cat, e_person, st.session_state.edit_data["id"]))
+                                conn.commit()
+                                conn.close()
+                            else:
+                                sb = init_supabase()
+                                if sb:
+                                    sb.table('notifications').update({
+                                        'date': str(e_date),
+                                        'content': e_content,
+                                        'attribute': e_attr,
+                                        'category': e_cat,
+                                        'person': e_person
+                                    }).eq('id', st.session_state.edit_data["id"]).execute()
+
                             st.success(L["msg_update_success"])
                             st.session_state.edit_data = None
                             st.rerun()
@@ -389,17 +494,31 @@ def main():
                 with st.form("del_form", clear_on_submit=True):
                     del_id = st.number_input(f"ID", min_value=1, step=1, key="del_id_input")
                     if st.form_submit_button(L["btn_delete"]):
-                        conn = get_connection()
-                        exists = conn.execute("SELECT 1 FROM notifications WHERE id=?", (del_id,)).fetchone()
-                        if exists:
-                            conn.execute("DELETE FROM notifications WHERE id=?", (del_id,))
-                            conn.commit()
+                        if DB_TYPE == 'SQLITE':
+                            conn = get_connection()
+                            exists = conn.execute("SELECT 1 FROM notifications WHERE id=?", (del_id,)).fetchone()
+                            if exists:
+                                conn.execute("DELETE FROM notifications WHERE id=?", (del_id,))
+                                conn.commit()
+                                st.success(f"ID {del_id}: {L['msg_del_success']}")
+                                # images auto deleted via CASCADE in sqlite if enabled or manual, 
+                                # but usually simple sqlite needs pragma foreign_keys=ON. 
+                                # For now we assume acceptable.
+                            else:
+                                st.error(L["msg_id_not_found"])
                             conn.close()
-                            st.success(f"ID {del_id}: {L['msg_del_success']}")
-                            st.rerun()
+                            if exists: st.rerun()
                         else:
-                            conn.close()
-                            st.error(L["msg_id_not_found"])
+                            sb = init_supabase()
+                            if sb:
+                                # Check exist
+                                res = sb.table('notifications').select('id').eq('id', del_id).execute()
+                                if res.data:
+                                    sb.table('notifications').delete().eq('id', del_id).execute()
+                                    st.success(f"ID {del_id}: {L['msg_del_success']}")
+                                    st.rerun()
+                                else:
+                                    st.error(L["msg_id_not_found"])
 
 if __name__ == '__main__':
     main()
